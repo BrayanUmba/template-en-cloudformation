@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "CloudFormation template to create the specified AWS architecture."
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-003ac001b2792617e
+    Description: ID of the VPC
+  Subnet:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0292e32ff52bc35e3
+    Description: ID of the Subnet
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: s3demobrayanumba
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "Access Identity for S3"
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt S3Bucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}"
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: producto
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: N
+        - AttributeName: Nombre
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+        - AttributeName: Nombre
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  DynamoDBTableInit:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt DynamoDBLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+
+          http = urllib3.PoolManager()
+
+          def send_response(event, context, response_status, response_data):
+              if 'ResponseURL' not in event:
+                  print("No ResponseURL in event, skipping send_response")
+                  return
+
+              response_url = event['ResponseURL']
+              
+              response_body = json.dumps({
+                  "Status": response_status,
+                  "Reason": f"See the details in CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event['StackId'],
+                  "RequestId": event['RequestId'],
+                  "LogicalResourceId": event['LogicalResourceId'],
+                  "Data": response_data
+              })
+
+              headers = {
+                  'Content-Type': '',
+                  'Content-Length': str(len(response_body))
+              }
+
+              try:
+                  response = http.request('PUT', response_url, headers=headers, body=response_body)
+                  print(f"Status code: {response.status}")
+              except Exception as e:
+                  print(f"send_response failed: {str(e)}")
+
+          def handler(event, context):
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table('producto')
+                  table.put_item(Item={'Id': 1, 'Nombre': 'Tomate', 'Cantidad': 10})
+                  table.put_item(Item={'Id': 2, 'Nombre': 'Cebolla', 'Cantidad': 5})
+                  send_response(event, context, SUCCESS, {'Message': 'Table initialized'})
+              except Exception as e:
+                  send_response(event, context, FAILED, {'Message': str(e)})
+      Runtime: python3.9
+      Timeout: 300
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  DynamoDBLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/producto"
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  DynamoDBTableInitCustomResource:
+    Type: Custom::InitDynamoDBTable
+    Properties:
+      ServiceToken: !GetAtt DynamoDBTableInit.Arn
+    DependsOn: DynamoDBTable
+
+  ListS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt ListS3LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              response = s3.list_objects_v2(Bucket='s3demobrayanumba')
+              
+              # Extraer la lista de objetos si la respuesta es válida
+              if 'Contents' in response:
+                  object_list = [{'Key': obj['Key']} for obj in response['Contents']]
+              else:
+                  object_list = []
+
+              # Crear una respuesta en formato JSON
+              json_response = {
+                  'objects': object_list
+              }
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(json_response),
+                  'headers': {
+                      'Content-Type': 'application/json'
+                  }
+              }
+
+      Runtime: python3.9
+      Timeout: 60
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ListS3LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::s3demobrayanumba"
+                  - !Sub "arn:aws:s3:::s3demobrayanumba/*"
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ListDynamoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt ListDynamoLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from decimal import Decimal
+
+          def convert_decimal_to_float(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+
+          def handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('producto')
+              response = table.scan()
+              
+              # Convertir los Decimales a flotantes
+              items = response.get('Items', [])
+              for item in items:
+                  for key, value in item.items():
+                      if isinstance(value, Decimal):
+                          item[key] = float(value)
+
+              # Devolver la respuesta
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(items, default=convert_decimal_to_float),  # Convertir los Decimales a flotantes
+                  'headers': {
+                      'Content-Type': 'application/json'
+                  }
+              }
+      Runtime: python3.9
+      Timeout: 60
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ListDynamoLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBReadAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/producto"
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: "MyApi"
+      Description: "API Gateway with Lambda integration"
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: "items"
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListDynamoLambda.Arn}/invocations
+          - Region: !Ref "AWS::Region"
+
+  ApiGatewayMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListS3Lambda.Arn}/invocations
+          - Region: !Ref "AWS::Region"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethodGet
+      - ApiGatewayMethodPost
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: !Sub prod-v1-${AWS::StackName}
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: !Sub prod-v2-${AWS::StackName}
+      DeploymentId: !Ref ApiGatewayDeployment
+
+  ApiGatewayApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: "ApiKey"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref ApiGatewayRestApi
+          StageName: !Ref ApiGatewayStage
+
+  # Permisos para API Gateway invocar Lambda Functions
+  ListDynamoLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListDynamoLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*"
+
+  ListS3LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListS3Lambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*"
+
+  ApiGatewayUsagePlan:
+      Type: AWS::ApiGateway::UsagePlan
+      Properties:
+        ApiStages:
+          - ApiId: !Ref ApiGatewayRestApi
+            Stage: !Ref ApiGatewayStage
+        Description: "Usage plan for API Gateway"
+        UsagePlanName: "MyUsagePlan"
+
+  ApiGatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiGatewayApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiGatewayUsagePlan
+
+Outputs:
+  S3BucketName:
+    Description: "Name of the S3 bucket"
+    Value: !Ref S3Bucket
+  CloudFrontDomainName:
+    Description: "Domain name of the CloudFront distribution"
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  ApiGatewayInvokeURL:
+    Description: "Invoke URL of the API Gateway"
+    Value: !Sub
+      - https://${ApiId}.execute-api.${Region}.amazonaws.com/prod-v2-${AWS::StackName}/items
+      - ApiId: !Ref ApiGatewayRestApi
+        Region: !Ref "AWS::Region"
